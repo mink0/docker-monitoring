@@ -1,0 +1,255 @@
+version: '3'
+
+networks:
+  elk:
+    driver: bridge
+  sentry:
+    driver: bridge
+  proxy:
+    driver: bridge
+  prometheus:
+    driver: bridge
+
+volumes:
+  elastic:
+    driver: vsphere:latest
+    driver_opts:
+      size: 70GB
+
+  redis:
+    driver: vsphere:latest
+    driver_opts:
+      size: 20GB
+
+  postgres:
+    driver: vsphere:latest
+    driver_opts:
+     size: 40GB
+
+  sentry:
+    driver: vsphere:latest
+    driver_opts:
+      size: 30GB
+
+  prometheus:
+    driver: vsphere:latest
+    driver_opts:
+      size: 70GB
+
+  grafana:
+    driver: vsphere:latest
+    driver_opts:
+      size: 1GB
+
+
+services:
+  nginx-proxy:
+    image: docker.local/nginx-proxy:0.6.0
+    container_name: nginx-proxy
+    ports:
+      - 80:80
+    restart: unless-stopped
+    networks:
+      - proxy
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+
+  logspout:
+    build: logspout/
+    image: docker.local/logspout:3.2.1
+    container_name: logspout
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - 8081:80
+    environment:
+      - SYSLOG_FORMAT=rfc3164
+      - ROUTE_URIS=logstash+tcp://logstash:5000
+    depends_on:
+      - logstash
+    restart: unless-stopped
+    networks:
+       - elk
+
+  elasticsearch:
+    image: docker.local/elasticsearch:5.3.1
+    container_name: elastic
+    volumes:
+      - elastic:/usr/share/elasticsearch/data
+    ports:
+      - 9200:9200
+      - 9300:9300
+    environment:
+      bootstrap.memory_lock: 'true'
+      ES_JAVA_OPTS: '-Xms2g -Xmx2g'
+      cluster.name: elk_cluster
+      xpack.security.enabled: 'false'
+      xpack.monitoring.enabled: 'false'
+      xpack.graph.enabled: 'false'
+      xpack.watcher.enabled: 'false'
+      http.cors.enabled: 'true'
+      discovery.zen.minimum_master_nodes: 1
+    restart: unless-stopped
+    networks:
+      - elk
+
+  logstash:
+    build: logstash/
+    image: docker.local/logstash:5.3.2
+    container_name: logstash
+    ports:
+      - 5000:5000
+      - 12201:12201/udp
+    environment:
+      LS_JAVA_OPTS: '-Xmx256m -Xms256m'
+    restart: unless-stopped
+    networks:
+      - elk
+    links:
+      - elasticsearch
+
+  kibana:
+    build: kibana/
+    image: docker.local/kibana:5.3.2
+    container_name: kibana
+    environment:
+      - VIRTUAL_HOST=kibana.local.ru
+    restart: unless-stopped
+    networks:
+      - proxy
+      - elk
+    depends_on:
+      - elasticsearch
+      - logstash
+
+  redis:
+    image: docker.local/redis:3.0.7
+    container_name: redis
+    volumes:
+      - redis:/data/
+    restart: unless-stopped
+    networks:
+      - sentry
+
+  postgres:
+    image: docker.local/postgres:9.5
+    container_name: postgres
+    environment:
+      - POSTGRES_DB=sentry
+      - POSTGRES_USER=sentry
+      - POSTGRES_PASSWORD=sentry
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres:/var/lib/postgresql/data:rw
+    restart: unless-stopped
+    networks:
+      - sentry
+
+  sentry-web:
+    image: docker.local/sentry:8.16
+    container_name: sentry-web
+    env_file:
+      - sentry-env-secret
+      - sentry-env
+    environment:
+      - VIRTUAL_HOST=sentry.local.ru
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sentry:/var/lib/sentry/files
+    command: run web
+    restart: unless-stopped
+    networks:
+      - proxy
+      - sentry
+
+  sentry-cron:
+    image: docker.local/sentry:8.16
+    container_name: sentry-cron
+    env_file:
+      - sentry-env-secret
+      - sentry-env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sentry:/var/lib/sentry/files
+    command: run cron
+    restart: unless-stopped
+    networks:
+      - sentry
+
+  sentry-worker:
+    image: docker.local/sentry:8.16
+    container_name: sentry-worker
+    env_file:
+      - sentry-env-secret
+      - sentry-env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sentry:/var/lib/sentry/files
+    command: run worker
+    restart: unless-stopped
+    networks:
+      - sentry
+
+  node-exporter:
+    image: docker.local/node-exporter:v0.14.0
+    container_name: node-exporter
+    volumes:
+      - /proc:/host/proc
+      - /sys:/host/sys
+      - /:/rootfs
+      - /etc/hostname:/etc/host_hostname
+    command:
+      - '-collector.procfs=/host/proc'
+      - '-collector.sysfs=/host/sys'
+      - '-collector.filesystem.ignored-mount-points="^/(sys|proc|dev|host|etc)($$|/)"'
+    restart: unless-stopped
+    networks:
+      - prometheus
+
+  cadvisor:
+    image: docker.local/cadvisor:v0.25.0
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: unless-stopped
+    networks:
+      - prometheus
+
+  prometheus:
+    build: prometheus/
+    image: docker.local/prometheus:v1.6.2
+    container_name: prometheus
+    volumes:
+      - prometheus:/prometheus
+    command:
+      - '-config.file=/etc/prometheus/prometheus.yml'
+      - '-storage.local.path=/prometheus'
+      - '-web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '-web.console.templates=/usr/share/prometheus/consoles'
+    restart: unless-stopped
+    networks:
+      - prometheus
+
+  grafana:
+    image: docker.local/grafana:4.2.0
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=password
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - VIRTUAL_HOST=grafana.local.ru
+    volumes:
+      - grafana:/var/lib/grafana
+    restart: unless-stopped
+    networks:
+      - prometheus
+      - proxy

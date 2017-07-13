@@ -1,0 +1,214 @@
+version: '3'
+
+services:
+  proxy:
+    image: docker.local/docker-flow-proxy
+    ports:
+      - 80:80
+      - 443:443
+    networks:
+      - proxy
+    environment:
+      - LISTENER_ADDRESS=swarm-listener
+      - MODE=swarm
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+    deploy:
+      replicas: 2
+
+  swarm-listener:
+    image: docker.local/docker-flow-swarm-listener:latest
+    networks:
+      - proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DF_NOTIFY_CREATE_SERVICE_URL=http://proxy:8080/v1/docker-flow-proxy/reconfigure
+      - DF_NOTIFY_REMOVE_SERVICE_URL=http://proxy:8080/v1/docker-flow-proxy/remove
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
+  logspout:
+    image: docker.local/logspout:3.2.1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - 8081:80
+    environment:
+      - SYSLOG_FORMAT=rfc3164
+      - ROUTE_URIS=logstash+tcp://logstash:5000
+    depends_on:
+      - logstash
+    networks:
+      - proxy
+      - default
+    deploy:
+      labels:
+        - com.df.notify=true
+        - com.df.distribute=true
+        - com.df.servicePath=/logs
+        - com.df.port=8081
+      mode: global
+
+  elasticsearch:
+    image: docker.local/elasticsearch:5.3.1
+    volumes:
+      - elastic:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      bootstrap.memory_lock: "true"
+      ES_JAVA_OPTS: "-Xms2g -Xmx2g"
+      cluster.name: "elk_cluster"
+      xpack.security.enabled: "false"
+      xpack.monitoring.enabled: "false"
+      xpack.graph.enabled: "false"
+      xpack.watcher.enabled: "false"
+      http.cors.enabled: "true"
+      discovery.zen.minimum_master_nodes: 1
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+      placement:
+        constraints: [node.role == manager]
+
+  logstash:
+    image: docker.local/logstash:5.3.2
+    ports:
+      - "5000:5000"
+      - "12201:12201/udp"
+    depends_on:
+      - elasticsearch
+    environment:
+      - LS_JAVA_OPTS=-Xmx256m -Xms256m
+      - LOGSPOUT=ignore
+    deploy:
+      placement:
+        constraints: [node.role == worker]
+
+  kibana:
+    image: docker.local/kibana:5.3.2
+    ports:
+      - "5601:5601"
+    depends_on:
+      - logstash
+    networks:
+      - proxy
+      - default
+    deploy:
+      labels:
+        - com.df.notify=true
+        - com.df.distribute=true
+        - com.df.serviceDomain=kibana.local.ru
+        - com.df.port=5601
+      placement:
+        constraints: [node.role == worker]
+
+  redis:
+    image: docker.local/redis:3.0.7
+    volumes:
+      - redis:/data/
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
+  postgres:
+    image: docker.local/postgres:9.5
+    environment:
+      - POSTGRES_DB=sentry
+      - POSTGRES_USER=sentry
+      - POSTGRES_PASSWORD=sentry
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres:/var/lib/postgresql/data:rw
+    deploy:
+      placement:
+        constraints: [node.role == worker]
+
+  sentry-web:
+    image: docker.local/sentry:8.16
+    ports:
+      - 9000:9000
+    env_file:
+      - sentry-env-secret
+      - sentry-env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sentry:/var/lib/sentry/files
+    command: run web
+    networks:
+      - proxy
+      - default
+    deploy:
+      labels:
+        - com.df.notify=true
+        - com.df.distribute=true
+        - com.df.serviceDomain=sentry.local.ru
+        - com.df.port=9000
+      placement:
+        constraints: [node.role == worker]
+
+  sentry-cron:
+    image: docker.local/sentry:8.16
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - sentry-env-secret
+      - sentry-env
+    volumes:
+      - sentry:/var/lib/sentry/files
+    command: run cron
+    deploy:
+      placement:
+        constraints: [node.role == worker]
+
+  sentry-worker:
+    image: docker.local/sentry:8.16
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - sentry-env-secret
+      - sentry-env
+    volumes:
+      - sentry:/var/lib/sentry/files
+    command: run worker
+    deploy:
+      placement:
+        constraints: [node.role == worker]
+
+volumes:
+  elastic:
+    driver: "vsphere"
+    driver_opts:
+      size: "70GB"
+
+  redis:
+    driver: "vsphere"
+    driver_opts:
+      size: "20GB"
+
+  postgres:
+   driver: "vsphere"
+   driver_opts:
+     size: "40GB"
+
+  sentry:
+    driver: "vsphere"
+    driver_opts:
+      size: "30GB"
+
+networks:
+  default:
+    external: false
+  proxy:
+    external: true
